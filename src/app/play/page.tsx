@@ -74,6 +74,10 @@ function PlayPageClient() {
   );
   const [currentId, setCurrentId] = useState(searchParams.get('id') || '');
 
+  // 搜索所需信息
+  const [searchTitle] = useState(searchParams.get('stitle') || '');
+  const [searchType] = useState(searchParams.get('stype') || '');
+
   // 是否需要优选
   const [needPrefer, setNeedPrefer] = useState(
     searchParams.get('prefer') === 'true'
@@ -159,7 +163,6 @@ function PlayPageClient() {
     const allResults: Array<{
       source: SearchResult;
       testResult: { quality: string; loadSpeed: string; pingTime: number };
-      score: number;
     } | null> = [];
 
     for (let start = 0; start < sources.length; start += batchSize) {
@@ -173,15 +176,15 @@ function PlayPageClient() {
               return null;
             }
 
-            const firstEpisodeUrl = source.episodes[0];
-            const testResult = await getVideoResolutionFromM3u8(
-              firstEpisodeUrl
-            );
+            const episodeUrl =
+              source.episodes.length > 1
+                ? source.episodes[1]
+                : source.episodes[0];
+            const testResult = await getVideoResolutionFromM3u8(episodeUrl);
 
             return {
               source,
               testResult,
-              score: calculateSourceScore(testResult),
             };
           } catch (error) {
             return null;
@@ -216,7 +219,6 @@ function PlayPageClient() {
     const successfulResults = allResults.filter(Boolean) as Array<{
       source: SearchResult;
       testResult: { quality: string; loadSpeed: string; pingTime: number };
-      score: number;
     }>;
 
     setPrecomputedVideoInfo(newVideoInfoMap);
@@ -226,11 +228,47 @@ function PlayPageClient() {
       return sources[0];
     }
 
+    // 找出所有有效速度的最大值，用于线性映射
+    const validSpeeds = successfulResults
+      .map((result) => {
+        const speedStr = result.testResult.loadSpeed;
+        if (speedStr === '未知' || speedStr === '测量中...') return 0;
+
+        const match = speedStr.match(/^([\d.]+)\s*(KB\/s|MB\/s)$/);
+        if (!match) return 0;
+
+        const value = parseFloat(match[1]);
+        const unit = match[2];
+        return unit === 'MB/s' ? value * 1024 : value; // 统一转换为 KB/s
+      })
+      .filter((speed) => speed > 0);
+
+    const maxSpeed = validSpeeds.length > 0 ? Math.max(...validSpeeds) : 1024; // 默认1MB/s作为基准
+
+    // 找出所有有效延迟的最小值和最大值，用于线性映射
+    const validPings = successfulResults
+      .map((result) => result.testResult.pingTime)
+      .filter((ping) => ping > 0);
+
+    const minPing = validPings.length > 0 ? Math.min(...validPings) : 50;
+    const maxPing = validPings.length > 0 ? Math.max(...validPings) : 1000;
+
+    // 计算每个结果的评分
+    const resultsWithScore = successfulResults.map((result) => ({
+      ...result,
+      score: calculateSourceScore(
+        result.testResult,
+        maxSpeed,
+        minPing,
+        maxPing
+      ),
+    }));
+
     // 按综合评分排序，选择最佳播放源
-    successfulResults.sort((a, b) => b.score - a.score);
+    resultsWithScore.sort((a, b) => b.score - a.score);
 
     console.log('播放源评分排序结果:');
-    successfulResults.forEach((result, index) => {
+    resultsWithScore.forEach((result, index) => {
       console.log(
         `${index + 1}. ${
           result.source.source_name
@@ -240,15 +278,20 @@ function PlayPageClient() {
       );
     });
 
-    return successfulResults[0].source;
+    return resultsWithScore[0].source;
   };
 
   // 计算播放源综合评分
-  const calculateSourceScore = (testResult: {
-    quality: string;
-    loadSpeed: string;
-    pingTime: number;
-  }): number => {
+  const calculateSourceScore = (
+    testResult: {
+      quality: string;
+      loadSpeed: string;
+      pingTime: number;
+    },
+    maxSpeed: number,
+    minPing: number,
+    maxPing: number
+  ): number => {
     let score = 0;
 
     // 分辨率评分 (40% 权重)
@@ -267,12 +310,12 @@ function PlayPageClient() {
         case 'SD':
           return 20;
         default:
-          return 30;
+          return 0;
       }
     })();
     score += qualityScore * 0.4;
 
-    // 下载速度评分 (40% 权重)
+    // 下载速度评分 (40% 权重) - 基于最大速度线性映射
     const speedScore = (() => {
       const speedStr = testResult.loadSpeed;
       if (speedStr === '未知' || speedStr === '测量中...') return 30;
@@ -285,25 +328,23 @@ function PlayPageClient() {
       const unit = match[2];
       const speedKBps = unit === 'MB/s' ? value * 1024 : value;
 
-      // 根据速度给分
-      if (speedKBps >= 5120) return 100; // ≥5MB/s
-      if (speedKBps >= 2048) return 85; // ≥2MB/s
-      if (speedKBps >= 1024) return 70; // ≥1MB/s
-      if (speedKBps >= 512) return 55; // ≥512KB/s
-      if (speedKBps >= 256) return 40; // ≥256KB/s
-      return 25; // <256KB/s
+      // 基于最大速度线性映射，最高100分
+      const speedRatio = speedKBps / maxSpeed;
+      return Math.min(100, Math.max(0, speedRatio * 100));
     })();
     score += speedScore * 0.4;
 
-    // 网络延迟评分 (20% 权重)
+    // 网络延迟评分 (20% 权重) - 基于延迟范围线性映射
     const pingScore = (() => {
       const ping = testResult.pingTime;
-      if (ping <= 50) return 100; // ≤50ms
-      if (ping <= 100) return 85; // ≤100ms
-      if (ping <= 200) return 70; // ≤200ms
-      if (ping <= 500) return 50; // ≤500ms
-      if (ping <= 1000) return 30; // ≤1s
-      return 15; // >1s
+      if (ping <= 0) return 0; // 无效延迟给默认分
+
+      // 如果所有延迟都相同，给满分
+      if (maxPing === minPing) return 100;
+
+      // 线性映射：最低延迟=100分，最高延迟=0分
+      const pingRatio = (maxPing - ping) / (maxPing - minPing);
+      return Math.min(100, Math.max(0, pingRatio * 100));
     })();
     score += pingScore * 0.2;
 
@@ -407,8 +448,14 @@ function PlayPageClient() {
   // 获取视频详情
   useEffect(() => {
     const fetchDetailAsync = async () => {
-      console.log('fetchDetailAsync', currentSource, currentId, videoTitle);
-      if (!currentSource && !currentId && !videoTitle) {
+      console.log(
+        'fetchDetailAsync',
+        currentSource,
+        currentId,
+        videoTitle,
+        searchTitle
+      );
+      if (!currentSource && !currentId && !videoTitle && !searchTitle) {
         setError('缺少必要参数');
         setLoading(false);
         return;
@@ -420,8 +467,15 @@ function PlayPageClient() {
         setLoadingStage('searching');
         setLoadingMessage('🔍 正在搜索播放源...');
 
-        const searchResults = await handleSearchSources(videoTitle);
+        const searchResults = await handleSearchSources(
+          searchTitle || videoTitle
+        );
         if (searchResults.length == 0) {
+          if (currentSource && currentId) {
+            // 跳过优选
+            setNeedPrefer(false);
+            return;
+          }
           setError('未找到匹配结果');
           setLoading(false);
           return;
@@ -453,12 +507,12 @@ function PlayPageClient() {
           const detailData = await fetchVideoDetail({
             source: currentSource,
             id: currentId,
-            fallbackTitle: videoTitleRef.current.trim(),
-            fallbackYear: videoYearRef.current,
+            fallbackTitle: searchTitle || videoTitleRef.current.trim(),
           });
 
           // 更新状态保存详情
           setVideoTitle(detailData.title || videoTitleRef.current);
+          setVideoYear(detailData.year);
           setVideoCover(detailData.poster);
           setDetail(detailData);
 
@@ -470,6 +524,11 @@ function PlayPageClient() {
           // 清理URL参数（移除index参数）
           if (searchParams.has('index')) {
             const newUrl = new URL(window.location.href);
+            newUrl.searchParams.set('year', detailData.year);
+            newUrl.searchParams.set(
+              'title',
+              detailData.title || videoTitleRef.current
+            );
             newUrl.searchParams.delete('index');
             newUrl.searchParams.delete('position');
             window.history.replaceState({}, '', newUrl.toString());
@@ -493,7 +552,7 @@ function PlayPageClient() {
     };
 
     fetchDetailAsync();
-  }, [currentSource, currentId]);
+  }, [currentSource, currentId, needPrefer]);
 
   // 播放记录处理
   useEffect(() => {
@@ -608,6 +667,10 @@ function PlayPageClient() {
                   result.episodes.length === 1) ||
                 (detailRef.current.episodes.length > 1 &&
                   result.episodes.length > 1)
+              : true) &&
+            (searchType
+              ? (searchType === 'tv' && result.episodes.length > 1) ||
+                (searchType === 'movie' && result.episodes.length === 1)
               : true)
         );
         if (exactMatchs.length > 0) {
@@ -657,8 +720,7 @@ function PlayPageClient() {
       const newDetail = await fetchVideoDetail({
         source: newSource,
         id: newId,
-        fallbackTitle: newTitle.trim(),
-        fallbackYear: videoYearRef.current,
+        fallbackTitle: searchTitle || newTitle.trim(),
       });
 
       // 尝试跳转到当前正在播放的集数
@@ -681,9 +743,11 @@ function PlayPageClient() {
       const newUrl = new URL(window.location.href);
       newUrl.searchParams.set('source', newSource);
       newUrl.searchParams.set('id', newId);
+      newUrl.searchParams.set('year', newDetail.year);
       window.history.replaceState({}, '', newUrl.toString());
 
       setVideoTitle(newDetail.title || newTitle);
+      setVideoYear(newDetail.year);
       setVideoCover(newDetail.poster);
       setCurrentSource(newSource);
       setCurrentId(newId);
@@ -855,19 +919,21 @@ function PlayPageClient() {
       await savePlayRecord(currentSourceRef.current, currentIdRef.current, {
         title: videoTitleRef.current,
         source_name: detailRef.current?.source_name || '',
-        year: detailRef.current?.year || '',
+        year: detailRef.current?.year,
         cover: detailRef.current?.poster || '',
         index: currentEpisodeIndexRef.current + 1, // 转换为1基索引
         total_episodes: detailRef.current?.episodes.length || 1,
         play_time: Math.floor(currentTime),
         total_time: Math.floor(duration),
         save_time: Date.now(),
+        search_title: searchTitle,
       });
 
       lastSaveTimeRef.current = Date.now();
       console.log('播放进度已保存:', {
         title: videoTitleRef.current,
         episode: currentEpisodeIndexRef.current + 1,
+        year: detailRef.current?.year,
         progress: `${Math.floor(currentTime)}/${Math.floor(duration)}`,
       });
     } catch (err) {
@@ -941,10 +1007,11 @@ function PlayPageClient() {
         {
           title: videoTitleRef.current,
           source_name: detailRef.current?.source_name || '',
-          year: detailRef.current?.year || '',
+          year: detailRef.current?.year,
           cover: detailRef.current?.poster || '',
           total_episodes: detailRef.current?.episodes.length || 1,
           save_time: Date.now(),
+          search_title: searchTitle,
         }
       );
       setFavorited(newState);
@@ -1194,7 +1261,6 @@ function PlayPageClient() {
         if (artPlayerRef.current.currentTime > 0) {
           return;
         }
-        setError('视频播放失败');
       });
 
       // 监听视频播放结束事件，自动播放下一集
@@ -1503,7 +1569,7 @@ function PlayPageClient() {
                 onSourceChange={handleSourceChange}
                 currentSource={currentSource}
                 currentId={currentId}
-                videoTitle={videoTitle}
+                videoTitle={searchTitle || videoTitle}
                 availableSources={availableSources}
                 onSearchSources={handleSearchSources}
                 sourceSearchLoading={sourceSearchLoading}
